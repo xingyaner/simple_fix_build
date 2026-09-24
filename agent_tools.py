@@ -18,10 +18,17 @@ from utils.error_handler import format_path_error
 
 logger = logging.getLogger(__name__)
 
-ENABLE_REFLECTION = True
-ENABLE_ROLLBACK = True
-ENABLE_HISTORY_ENHANCEMENT = True
-ENABLE_EXPERT_KNOWLEDGE = True
+"""Feature switches for the simple iterative baseline.
+
+The baseline intentionally excludes RSMC, HSR, ECRCL, and FGRK.  Keep these
+named switches (rather than deleting the implementations) so the full system
+can still be reproduced from the original project, while this repository has a
+clear, auditable ablation configuration.
+"""
+ENABLE_REFLECTION = False
+ENABLE_ROLLBACK = False
+ENABLE_HISTORY_ENHANCEMENT = False
+ENABLE_EXPERT_KNOWLEDGE = False
 
 # Mechanism ablation mapping:
 # - ENABLE_REFLECTION -> RSMC
@@ -4427,15 +4434,17 @@ def prompt_generate_tool(
         config_folder_path: str,
         attempt_id: int
 ) -> dict:
-    """
-    物理组装工具：从账本、归因工件和RAG库中提取信息并生成最终的 prompt.txt。
+    """Assemble only current build evidence for the iterative baseline.
+
+    Validation output and the current workspace remain the only evidence fed
+    to the coding agent.  No history ledger, root-cause localization, or
+    expert-knowledge retrieval is used in this mode.
     """
     import os, re
 
     print(f"--- Workflow Tool: prompt_generate_tool started (Attempt: {attempt_id}) ---")
 
     session = tool_context.session
-    current_node_id = session.state.get("current_node_id", 0)
     validation_report = session.state.get("last_validation_report", {})
     basic_info = extract_basic_information(session.state.get("basic_information"))
     if basic_info.get("project_source_path"):
@@ -4458,83 +4467,16 @@ def prompt_generate_tool(
     FUZZ_LOG_PATH = "fuzz_build_log_file/fuzz_build_log.txt"
     os.makedirs(PROMPT_DIR, exist_ok=True)
 
-    # =================================================================
-    # 1. 自动组装历史策略轨迹 (自适应节点检查)
-    # =================================================================
-    enhanced_history = ""
-
-    if current_node_id == 0:
-        enhanced_history = "LOG: This is the initial baseline attempt. No previous repair history exists."
-    else:
-        ledger = TraceLedgerManager.load_ledger()
-        parent_chain_ids = _collect_parent_chain_node_ids(ledger, current_node_id, limit=3, include_self=False)
-        history_labels = ["ROUND N", "ROUND N-1", "ROUND N-2"]
-        for idx, nid in enumerate(parent_chain_ids):
-            res = query_trace_ledger(
-                tool_context=tool_context,
-                field_keys=[
-                    "action_and_intent.repair_strategy",
-                    "action_and_intent.loop_summary",
-                    "semantic_memory.reflection_analysis"
-                ],
-                node_id=nid
-            )
-            if res["status"] == "success":
-                data = res["data"]
-                label = "INITIAL BASELINE" if nid == 0 else history_labels[idx] if idx < len(history_labels) else f"ROUND {nid}"
-                enhanced_history += f"\n--- [{label} REFLECTION] ---\n"
-                enhanced_history += f"Strategy: {data.get('action_and_intent.repair_strategy', 'N/A')}\n"
-                enhanced_history += f"Summary: {data.get('action_and_intent.loop_summary', 'N/A')}\n"
-                enhanced_history += f"Reflection: {data.get('semantic_memory.reflection_analysis', 'N/A')}\n"
-
-    if not enhanced_history.strip():
-        enhanced_history = "No relevant historical trajectory found in trace ledger."
-
-    # =================================================================
-    # 2. 提取当前 ECRCL 归因工件 (故障根因)
-    # =================================================================
-    causal_chain = "N/A"
-    final_attribution = "N/A"
-    commit_changed_path = os.path.abspath("generated_prompt_file/commit_changed.txt")
-
-    if os.path.exists(commit_changed_path):
-        try:
-            with open(commit_changed_path, 'r', encoding='utf-8') as f:
-                txt = f.read()
-                # 🔑 Optimized Parser: Detect fallback mode
-                if "[STATUS]: FAILED" in txt:
-                    causal_chain = "Localization failed. System has automatically switched to Log-Based Diagnostic Mode."
-                else:
-                    cc_match = re.search(r"\[CAUSAL_CHAIN\]\s*([\s\S]*?)(?=\n\n\[|$)", txt)
-                    if cc_match: causal_chain = cc_match.group(1).strip()
-
-                fa_match = re.search(r"\[FINAL_ATTRIBUTION\]\s*([\s\S]*)$", txt)
-                if fa_match: final_attribution = fa_match.group(1).strip()
-        except Exception as e:
-            print(f"Warning: Failed to parse commit_changed.txt: {e}")
-
-    # =================================================================
-    # 3. 物理触发 Few-shot RAG 检索
-    # =================================================================
-    rag_res = few_shot_rag_retrieve("expert_knowledge.json", FUZZ_LOG_PATH)
-    expert_context = rag_res.get("rag_context", "No expert knowledge matched.")
-
-    # =================================================================
-    # 4. 组装最终 Prompt 文件
-    # =================================================================
+    # Assemble the current validation evidence without any mechanism-specific
+    # context.  This keeps the baseline's prompt and search budget comparable.
     project_name = os.path.basename(os.path.abspath(project_main_folder_path))
 
     with open(PROMPT_FILE_PATH, "w", encoding="utf-8") as f:
-        f.write(f"Testing Expert. Project: {project_name}. Attempt: {attempt_id}\n")
+        f.write(f"Build repair task. Project: {project_name}. Attempt: {attempt_id}\n")
 
         f.write("\n--- 【LAST BUILD VALIDATION (1+2+6 CRITERIA)】 ---\n")
         for k in ["step_1_official_list", "step_2_infra_compliance", "step_6_runtime_stability"]:
             f.write(f"{k.upper()}: {validation_report.get(k, 'N/A')}\n")
-
-        f.write(f"\n【STRATEGIC KNOWLEDGE (RAG)】\n{expert_context}\n")
-        f.write(f"\n【CAUSAL_CHAIN】\n{causal_chain}\n")
-        f.write(f"\n【FINAL_ATTRIBUTION】\n{final_attribution}\n")
-        f.write(f"\n【REPAIR_HISTORY_TRAJECTORY】\n{enhanced_history}\n")
 
         # 注入 Docker/Build 配置文件
         for fname in sorted(os.listdir(config_folder_path)):

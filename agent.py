@@ -1030,32 +1030,8 @@ def initialize_agents(session_state: dict = None, repair_only: bool = False) -> 
     Dynamically instantiates all agents and binds into linear Workflow.
     Remove internal Loop/ring back, drive iteration by outer Python loop.
     """
-    # 提取注入上下文
-    rc_commit = str(session_state.get("root_cause_commit", "")) if session_state else ""
-    rc_workspace = str(session_state.get("root_cause_workspace", "")) if session_state else ""
-
-    # 加载并动态注入指令
-    finder_instr = load_instruction_from_file("instructions/commit_finder_instruction.txt")
-
-    # --- 审计代码：打印指令注入情况 ---
-    # print(f"[AUDIT] Agent Instruction Injection: commit={rc_commit}, workspace={rc_workspace}")
-
-    if not rc_commit or rc_commit == "N/A":
-        # 移除关于 Bypass 的逻辑块
-        processed_instruction = finder_instr.replace("{root_cause_commit?}", "").replace("{root_cause_workspace?}", "")
-        # 可选：在指令中追加一行提示，告知 Agent 没有预设值，直接全量搜索
-        processed_instruction += "\n# NOTE: No pre-specified root cause detected. Execute full standard localization."
-    else:
-        processed_instruction = finder_instr.replace("{root_cause_commit?}", rc_commit) \
-            .replace("{root_cause_workspace?}", rc_workspace) \
-            .replace("{root_cause_commit}", rc_commit) \
-            .replace("{root_cause_workspace}", rc_workspace)
-
-    # --- 审计代码：将最终注入后的指令打印到控制台 ---
-    # print(f"\n[AUDIT] Commit Finder Instruction injected with: Commit={rc_commit}, Workspace={rc_workspace}")
-    # print(f"[AUDIT] Final Instruction snippet: {processed_instruction[:4000]}...")
-
-    # 1. 初始化所有 LlmAgent
+    # The baseline uses the same setup and validation backend but deliberately
+    # has no reflection, rollback, history-localization, or RAG sub-agent.
     initial_setup_agent = LlmAgent(
         name="initial_setup_agent",
         model=LiteLlm(model=MODEL, api_base=api_base, api_key=API_KEY, temperature=0.0, top_p=0.1, seed=LLM_SEED),
@@ -1089,43 +1065,6 @@ def initialize_agents(session_state: dict = None, repair_only: bool = False) -> 
         output_key="decision_result",
     )
 
-    rsmc_agent = LlmAgent(
-        name="rsmc_agent",
-        model=LiteLlm(model=MODEL, api_base=api_base, api_key=API_KEY, temperature=0.2, top_p=0.3, seed=LLM_SEED),
-        instruction=load_instruction_from_file("instructions/rsmc_instruction.txt"),
-        tools=[read_file_content, init_or_update_rsmc_ledger, query_trace_ledger],
-        output_key="loop_summary",
-    )
-
-    rollback_agent = LlmAgent(
-        name="rollback_agent",
-        model=LiteLlm(model=MODEL, api_base=api_base, api_key=API_KEY, temperature=0.0, top_p=0.1, seed=LLM_SEED),
-        instruction=load_instruction_from_file("instructions/rollback_instruction.txt"),
-        tools=[
-            cbsc_classify_log,
-            execute_hsr_decision,
-            clear_commit_analysis_state
-        ],
-        output_key="hsr_decision",
-    )
-
-    commit_finder_agent = LlmAgent(
-        name="commit_finder_agent",
-        model=LiteLlm(model=MODEL, api_base=api_base, api_key=API_KEY, temperature=0.0, top_p=0.1, seed=LLM_SEED),
-        instruction=processed_instruction,
-        tools=[
-            read_file_content,
-            check_file_exists,
-            extract_buggy_line_info,
-            get_project_paths,
-            list_files_in_dir,
-            run_command,
-            update_yaml_report,
-            run_ecrcl_localization,
-        ],
-        output_key="commit_analysis_result",
-    )
-
     prompt_generate_agent = LlmAgent(
         name="prompt_generate_agent",
         model=LiteLlm(model=MODEL, api_base=api_base, api_key=API_KEY, max_output_tokens=16384, temperature=0.2, top_p=0.3,
@@ -1139,8 +1078,6 @@ def initialize_agents(session_state: dict = None, repair_only: bool = False) -> 
             list_files_in_dir,
             create_or_update_file,
             append_string_to_file,
-            few_shot_rag_retrieve,
-            query_trace_ledger,
         ],
         output_key="generated_prompt",
     )
@@ -1163,7 +1100,6 @@ def initialize_agents(session_state: dict = None, repair_only: bool = False) -> 
             read_file_content,
             commit_workspace_snapshots,
             create_or_update_file,
-            update_trace_ledger
         ],
         output_key="patch_application_result",
     )
@@ -1172,9 +1108,6 @@ def initialize_agents(session_state: dict = None, repair_only: bool = False) -> 
     setup_node = node(initial_setup_agent, name="initial_setup_agent")
     fuzz_node = node(run_fuzz_and_collect_log_agent, name="run_fuzz_and_collect_log_agent")
     decision_node = node(decision_agent, name="decision_agent")
-    rsmc_node = node(rsmc_agent, name="rsmc_agent")
-    rollback_node = node(rollback_agent, name="rollback_agent")
-    finder_node = node(commit_finder_agent, name="commit_finder_agent")
     prompt_node = node(prompt_generate_agent, name="prompt_generate_agent")
     solver_node = node(fuzzing_solver_agent, name="fuzzing_solver_agent")
     applier_node = node(solution_applier_agent, name="solution_applier_agent")
@@ -1200,10 +1133,7 @@ def initialize_agents(session_state: dict = None, repair_only: bool = False) -> 
         (setup_node, fuzz_node),
         (fuzz_node, decision_node),
         (decision_node, router_node),
-        Edge(from_node=router_node, route="continue", to_node=rsmc_node),
-        (rsmc_node, rollback_node),
-        (rollback_node, finder_node),
-        (finder_node, prompt_node),
+        Edge(from_node=router_node, route="continue", to_node=prompt_node),
         (prompt_node, solver_node),
         (solver_node, applier_node),
         (applier_node, fuzz_node),  # 闭环核心：补丁应用后触发重新编译

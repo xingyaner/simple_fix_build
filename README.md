@@ -1,10 +1,15 @@
-# OSS-Fuzz Autonomous Fuzz Build Repair Agent
+# simple_fix_build
 
 [📊 BuildFixBench Dataset Homepage](https://xingyaner.github.io/BuildFixBench/)
 
 BuildFixBench is a benchmark dataset for reproducing and repairing fuzzing build failures observed in OSS-Fuzz. Each case provides the metadata needed to recreate the failing environment, including the OSS-Fuzz and upstream commit SHAs, archived build log, fuzzing engine, sanitizer, architecture, base-image digest, error category, and—when available—the root-cause commit and workspace.
 
-This project is a high-performance, industrial-grade autonomous agent system designed to fix build errors in **OSS-Fuzz**. It leverages LLMs (DeepSeek) and a multi-agent orchestration framework (**google-adk**) to perform environment locking, root cause analysis, and dual-track (Config vs. Source) code repair.
+`simple_fix_build` is a general-purpose iterative coding agent for repairing
+**OSS-Fuzz** build failures. It uses the same repository access, OSS-Fuzz build
+environment, and validation backend as the full system, but deliberately
+removes ECRCL, FGRK, RSMC, and HSR. Each failed validation round gives a coding
+agent the current build evidence, lets it produce a minimal patch, and reruns
+the unchanged validator.
 
 ## 🚀 Core Features
 
@@ -12,12 +17,11 @@ This project is a high-performance, industrial-grade autonomous agent system des
     *   **Step 1 (Primary Build)**: Successful generation of executable target binaries.
     *   **Step 6 (Runtime Stability Audit)**: A mandatory **45s critical stability test** ensuring execution speed (exec/s) > 0.
     *   **Steps 2-5 (Quality Metrics)**: Verification of Sanitizer injection (ASan), Engine symbols (libFuzzer/AFL++), Project logic linking, and Shared dependency integrity.
-2.  **HAFix (Heuristic History-Enhanced Localization)**: Automatically identifies the "Buggy Commit" by analyzing Git history (`git blame`, `fl_diff`, `fn_pair`) to provide temporal context for the LLM.
-3.  **Physical State Tree Rollback**: Utilizes Git to manage physical snapshots of the environment. If a repair path deteriorates (score > 7), the system performs a physical `git reset` to a stable state and clears the previous analysis bias.
-4.  **Token-Efficient Memory Management**: 
-    *   **Prune Session History**: A whitelist-based strategy that physically wipes intermediate tool call noise (ls, find, read_file) while retaining core reasoning.
-    *   **Context Truncation**: Specialized `tail_100_lines` logging and summary agents keep context within the 131k token limit.
-5.  **Expert Knowledge RAG-Lite**: Matches build log patterns against a curated `expert_knowledge.json` to inject strategic guidance for complex infrastructure issues (e.g., WORKDIR conflicts).
+2.  **Simple iterative repair loop**: On failure, the coding agent receives the
+    current validation summary, build-log tail, and relevant current files;
+    it then proposes and applies a minimal patch before the next build.
+3.  **Mechanism-free baseline**: ECRCL, FGRK, RSMC, and HSR are disabled and
+    absent from the workflow route and the coding-agent tool set.
 
 ## Real-World Merged Repairs
 
@@ -108,13 +112,14 @@ API_KEY='your_api_key_here'
 ### Phase 1: Deterministic Setup
 `initial_setup_agent` locks the Docker base image digest and checkouts the exact Git SHAs. It enforces `build_mode: source` for local mounting.
 
-### Phase 2: Inner Loop (Max 8-15 Iterations)
+### Phase 2: Inner Loop (Max 6 Iterations)
 *   **Build & 1+6 Audit**: `run_fuzz_and_collect_log_agent` executes the build via `run_fuzz_build_and_validate`.
-*   **Decision**: `decision_agent` checks if Step 1 (Build) and Step 6 (Runtime) both passed.
-*   **Reflection**: `reflection_agent` assigns a **Deterioration Score (1-10)** based on the 1+6 metrics.
-*   **Rollback**: Catastrophic failures trigger a physical environment revert via Git.
-*   **Diagnosis (HAFix)**: `commit_finder_agent` locates the buggy commit using temporal or trace analysis.
-*   **Solve & Apply**: `fuzzing_solver_agent` generates a multi-file Patch Plan, which is then applied by `solution_applier_agent`.
+*   **Decision**: `decision_agent` stops only when the existing Step 2 compliance result passes.
+*   **Solve & Apply**: the context, coding, and patch-application agents use
+    current build evidence to generate and apply a minimal patch.
+
+The validation implementation is unchanged. The feature switches in
+`agent_tools.py` are all `False` and document the four excluded mechanisms.
 
 ### Phase 3: Cleanup & Archive
 Successful fixes are validated, archived to `process/fixed/` with full content, and the `projects.yaml` report is updated.
