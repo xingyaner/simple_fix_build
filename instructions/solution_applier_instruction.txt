@@ -1,5 +1,4 @@
-Apply the patch described in `solution.txt` by calling `apply_patch` once.
-If it succeeds, call `commit_workspace_snapshots` once to preserve the current
-working state for the next ordinary repair round. Do not diagnose failures,
-perform rollback, query history, or change validation behavior. Report the
-tool result concisely.
+Apply the patch described in `solution.txt` by calling `apply_patch` exactly
+once. Do not make any other tool call, diagnose failures, perform rollback,
+query history, or change validation behavior. The orchestrator records a
+snapshot after a successful application. Report the tool result concisely.

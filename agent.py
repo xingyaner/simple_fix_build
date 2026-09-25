@@ -236,6 +236,44 @@ def wrap_tools(tools: List[Any]) -> List[Any]:
     return [tool_defense_decorator(t) for t in tools]
 
 
+def read_current_build_log() -> Dict[str, Any]:
+    """Expose only the current build-log tail to non-coding agents."""
+    return read_file_content("fuzz_build_log_file/fuzz_build_log.txt", mode="tail_40_lines")
+
+
+def _is_repair_workspace_path(file_path: str) -> bool:
+    normalized = file_path.replace("\\", "/").lstrip("./")
+    return normalized == "generated_prompt_file/prompt.txt" or normalized.startswith((
+        "oss-fuzz/projects/", "process/project/"
+    ))
+
+
+def read_repair_workspace_file(file_path: str, mode: str = "full") -> Dict[str, Any]:
+    """Read only current-round evidence and active repair workspaces."""
+    if not _is_repair_workspace_path(file_path):
+        return {"status": "error", "message": "Only current repair-workspace files may be read."}
+    return read_file_content(file_path, mode=mode)
+
+
+def list_repair_workspace_files(dir_path: str, max_depth: int = 2) -> Dict[str, Any]:
+    """List only active OSS-Fuzz or upstream project directories."""
+    if not _is_repair_workspace_path(dir_path):
+        return {"status": "error", "message": "Only current repair-workspace directories may be listed."}
+    return list_files_in_dir(dir_path=dir_path, max_depth=max_depth)
+
+
+def write_repair_artifact(artifact: str, content: str) -> Dict[str, Any]:
+    """Allow the solver to write exactly the two patch artifacts."""
+    destinations = {
+        "solution": "solution.txt",
+        "strategy": "repair_strategy.txt",
+    }
+    destination = destinations.get(artifact)
+    if destination is None:
+        return {"status": "error", "message": "artifact must be 'solution' or 'strategy'."}
+    return create_or_update_file(file_path=destination, content=content)
+
+
 # =====================================================================
 # 辅助函数：安全记忆清理与状态脱水 (物理手术完全无状态版)
 # =====================================================================
@@ -249,12 +287,12 @@ async def _safe_memory_cleaning(session_service: InMemorySessionService, session
         return
 
     # 1. 状态字典脱水：仅对明确占用空间的超大键进行脱水，直接清理死码变量保护性能
-    massive_keys = ["fuzz_build_log", "commit_analysis_result", "generated_prompt"]
+    massive_keys = ["fuzz_build_log", "generated_prompt"]
 
     for key in list(session.state.keys()):
         # 只要是已知的超大负载 key，统一实施安全脱水，避免撑爆 Token 窗口
         if key in massive_keys:
-            session.state[key] = "[DEHYDRATED: SUMMARY IN LEDGER]"
+            session.state[key] = "[DEHYDRATED: retained on disk]"
 
     print(
         f"--- 🧼 [SAFE CLEANSED] Dehydrated massive state keys for session {session_id}. Event history and core env metadata preserved. ---")
@@ -306,11 +344,8 @@ def _generate_final_report(
         is_successful: bool,
         attempt_id: int,
         stats: dict,
-        attempt_tokens: dict,
-        attempt_start_time: float,
-        attempt_expert_matched: bool,
-        attempt_last_patch_files: int,
-        attempt_last_patch_lines: int,
+        project_tokens: dict,
+        project_start_time: float,
         final_patch_snapshot: Optional[Dict[str, str]] = None,
 ):
     """
@@ -320,25 +355,10 @@ def _generate_final_report(
     project_name = project_info.get('project_name', 'UNKNOWN')
     error_time = project_info.get('error_time', 'UNKNOWN')
 
-    # ── 1. 从账本读取回退次数和根因定位结果 ──────────────────────────────
-    rollback_count = 0
-    root_cause_located = False
+    # The baseline reports only observable workflow events.  It must not infer
+    # mechanism-specific outcomes from the removed ledger/rollback machinery.
     try:
-        ledger = TraceLedgerManager.load_ledger()
-        for n in ledger.get("nodes", []):
-            # 回退次数：should_rollback 为 true 的节点数
-            if str(n.get("identification", {}).get("should_rollback", "false")).lower() == "true":
-                rollback_count += 1
-            # 根因定位：任意节点的 root_cause_commit_sha 非空且非 N/A
-            sha_val = n.get("action_and_intent", {}).get("root_cause_commit_sha", "")
-            if sha_val and sha_val not in ("N/A", "", "UNKNOWN"):
-                root_cause_located = True
-    except Exception as e:
-        print(f"--- ⚠️ [REPORT] Failed to read ledger for stats: {e} ---")
-
-    # ── 2. 计算时间消耗 ──────────────────────────────────────────────────
-    try:
-        elapsed_seconds = time.time() - attempt_start_time
+        elapsed_seconds = time.time() - project_start_time
         elapsed_minutes = elapsed_seconds / 60.0
         time_cost_str = f"{elapsed_minutes:.2f} minutes"
     except Exception:
@@ -346,16 +366,15 @@ def _generate_final_report(
 
     # ── 3. 组装报告文本 ──────────────────────────────────────────────────
     result_icon = "✅ SUCCESS" if is_successful else "❌ FAILURE"
-    repair_rounds = stats.get("repair_rounds", 0)
-    total_tokens = attempt_tokens.get("total", 0)
-    input_tokens = attempt_tokens.get("prompt", 0)
-    output_tokens = attempt_tokens.get("completion", 0)
+    repair_rounds = stats.get("successful_patch_applications", 0)
+    input_tokens = project_tokens.get("prompt", 0)
+    output_tokens = project_tokens.get("completion", 0)
 
     # Report the complete declared patch from the immutable original-failure
     # baseline to the final verified HEAD. Do not reuse a historical
     # apply_patch event, which may describe a candidate that was later rolled
     # back.
-    final_files = attempt_last_patch_files
+    final_files = 0
     final_added = final_deleted = final_hunks = 0
     try:
         if is_successful and final_patch_snapshot:
@@ -363,10 +382,11 @@ def _generate_final_report(
             if not patch_metrics:
                 verified_patches = agent_tools.get_verified_snapshot_patches(final_patch_snapshot)
                 patch_metrics = verified_patches["metrics"]
-            final_files = patch_metrics["files"]
-            final_added = patch_metrics["added"]
-            final_deleted = patch_metrics["deleted"]
-            final_hunks = patch_metrics["hunks"]
+            if patch_metrics.get("files", 0):
+                final_files = patch_metrics["files"]
+                final_added = patch_metrics["added"]
+                final_deleted = patch_metrics["deleted"]
+                final_hunks = patch_metrics["hunks"]
     except Exception as exc:
         print(f"--- ⚠️ [REPORT] Final Git metric calculation failed; using fallback counters: {exc} ---")
 
@@ -378,16 +398,14 @@ def _generate_final_report(
         f"  - [Result]: {result_icon}",
         f"  - [Attempt Rounds]: {attempt_id}",
         f"  - [Repair Rounds]: {repair_rounds}",
-        f"  - [Rollback]: {rollback_count}",
-        f"  - [Root Cause Location]: {root_cause_located}",
-        f"  - [Expert Match]: {attempt_expert_matched}",
+        f"  - [Build Calls]: {stats.get('build_calls', 0)}",
         f"  - [Time Cost]: {time_cost_str}",
         f"  - [Input Tokens]: {input_tokens}",
         f"  - [Output Tokens]: {output_tokens}",
         f"  - [Files Change]: {final_files}",
         f"  - [Lines Added]: {final_added}",
         f"  - [Lines Deleted]: {final_deleted}",
-        f"  - [Lines Change]: {final_added + final_deleted if final_added or final_deleted else attempt_last_patch_lines}",
+        f"  - [Lines Change]: {final_added + final_deleted}",
         f"  - [Diff Hunks]: {final_hunks}",
         "============================================================",
     ]
@@ -432,9 +450,10 @@ def exit_loop(tool_context: ToolContext):
 GLOBAL_LOGGER = AgentLogger()
 
 APP_NAME = "fix_build_agent_app"
-MODEL = os.getenv("MODEL", "")
-api_base = os.getenv("api_base", os.getenv("API_BASE", ""))
-API_KEY = os.getenv("API_KEY", "")
+MODEL = os.getenv("MODEL", "deepseek/deepseek-v4-flash")
+api_base = os.getenv("api_base", os.getenv("API_BASE"))
+# API_KEY = os.getenv("API_KEY", "")
+API_KEY = os.getenv("API_KEY")
 USER_ID = "default_user"
 MAX_RETRIES = 2
 MAX_INTERNAL_ROUNDS = 6
@@ -511,18 +530,19 @@ def _snapshot_verified_solution(snapshot_dir: str) -> Optional[Dict[str, str]]:
     return {"solution": solution_path, "strategy": strategy_path}
 
 
-def _attach_verified_git_refs(project_name: str, snapshot: Optional[Dict[str, str]]) -> None:
+def _attach_verified_git_refs(project_name: str, snapshot: Optional[Dict[str, str]],
+                              original_source_sha: str = "N/A",
+                              original_config_sha: str = "N/A") -> None:
     """Record the original-failure and latest verified Git refs in the snapshot."""
     if snapshot is None:
         return
-    original = _initial_failure_baselines()
     source_path = os.path.join(os.getcwd(), "process", "project", project_name)
     config_path = os.path.join(os.getcwd(), "oss-fuzz")
     snapshot.update({
         "source_path": source_path,
         "config_repo_path": config_path,
-        "original_source_sha": original.get("source_sha", "N/A"),
-        "original_config_sha": original.get("config_sha", "N/A"),
+        "original_source_sha": original_source_sha,
+        "original_config_sha": original_config_sha,
         "latest_source_sha": get_verified_git_sha(source_path),
         "latest_config_sha": get_verified_git_sha(config_path),
     })
@@ -1043,7 +1063,6 @@ def initialize_agents(session_state: dict = None, repair_only: bool = False) -> 
             extract_build_metadata_from_log,
             patch_project_dockerfile,
             get_project_paths,
-            manage_git_state,
             checkout_project_commit,
         ],
         output_key="basic_information",
@@ -1053,7 +1072,7 @@ def initialize_agents(session_state: dict = None, repair_only: bool = False) -> 
         name="run_fuzz_and_collect_log_agent",
         model=LiteLlm(model=MODEL, api_base=api_base, api_key=API_KEY, temperature=0.0, top_p=0.1, seed=LLM_SEED),
         instruction=load_instruction_from_file("instructions/run_fuzz_and_collect_log_instruction.txt"),
-        tools=[read_file_content, run_fuzz_build_and_validate, get_workspace_root],
+        tools=[run_fuzz_build_and_validate, read_current_build_log],
         output_key="fuzz_build_log",
     )
 
@@ -1061,7 +1080,7 @@ def initialize_agents(session_state: dict = None, repair_only: bool = False) -> 
         name="decision_agent",
         model=LiteLlm(model=MODEL, api_base=api_base, api_key=API_KEY, temperature=0.0, top_p=0.1, seed=LLM_SEED),
         instruction=load_instruction_from_file("instructions/decision_instruction.txt"),
-        tools=[read_file_content, exit_loop],
+        tools=[read_current_build_log, exit_loop],
         output_key="decision_result",
     )
 
@@ -1070,15 +1089,7 @@ def initialize_agents(session_state: dict = None, repair_only: bool = False) -> 
         model=LiteLlm(model=MODEL, api_base=api_base, api_key=API_KEY, max_output_tokens=16384, temperature=0.2, top_p=0.3,
                       seed=LLM_SEED),
         instruction=load_instruction_from_file("instructions/prompt_generate_instruction.txt"),
-        tools=[
-            prompt_generate_tool,
-            save_file_tree_shallow,
-            find_and_append_file_details,
-            read_file_content,
-            list_files_in_dir,
-            create_or_update_file,
-            append_string_to_file,
-        ],
+        tools=[prompt_generate_tool],
         output_key="generated_prompt",
     )
 
@@ -1087,7 +1098,7 @@ def initialize_agents(session_state: dict = None, repair_only: bool = False) -> 
         model=LiteLlm(model=MODEL, api_base=api_base, api_key=API_KEY, max_output_tokens=8129, temperature=0.0, top_p=0.2,
                       seed=LLM_SEED),
         instruction=load_instruction_from_file("instructions/fuzzing_solver_instruction.txt"),
-        tools=[read_file_content, create_or_update_file,list_files_in_dir],
+        tools=[read_repair_workspace_file, list_repair_workspace_files, write_repair_artifact],
         output_key="solution_plan",
     )
 
@@ -1095,12 +1106,7 @@ def initialize_agents(session_state: dict = None, repair_only: bool = False) -> 
         name="solution_applier_agent",
         model=LiteLlm(model=MODEL, api_base=api_base, api_key=API_KEY, temperature=0.0, top_p=0.1, seed=LLM_SEED),
         instruction=load_instruction_from_file("instructions/solution_applier_instruction.txt"),
-        tools=[
-            apply_patch,
-            read_file_content,
-            commit_workspace_snapshots,
-            create_or_update_file,
-        ],
+        tools=[apply_patch],
         output_key="patch_application_result",
     )
 
@@ -1253,7 +1259,6 @@ async def process_single_project(
     agent_tools.APPLIED_PATCH_TARGETS.clear()
     agent_tools.set_active_project_context(project_name)
     agent_tools.set_project_phase("main")
-    TraceLedgerManager.set_active_project(project_name)
     safe_name = "".join(c for c in project_name if c.isalnum() or c in ('_', '-')).rstrip()
     expected_source_path = os.path.join(os.getcwd(), "process", "project", safe_name)
 
@@ -1263,49 +1268,37 @@ async def process_single_project(
 
     project_start_time = time.time()
     project_total_tokens = {"prompt": 0, "completion": 0, "total": 0}
-    full_deterioration_history = []
-
+    project_stats = {"successful_patch_applications": 0, "build_calls": 0}
     is_successful = False
     session = None
     final_basic_information = None
     last_run_stats = {}
 
     current_attempt_id = 0
-    stats = {"repair_rounds": 0, "build_calls": 0, "total_tokens": {"prompt": 0, "completion": 0, "total": 0}}
+    stats = {"successful_patch_applications": 0, "build_calls": 0,
+             "total_tokens": {"prompt": 0, "completion": 0, "total": 0}}
     attempt_tokens = {"prompt": 0, "completion": 0, "total": 0}
     attempt_start_time = project_start_time
-    attempt_expert_matched = False
-    attempt_last_patch_files = 0
-    attempt_last_patch_lines = 0
     final_patch_snapshot = None
+    original_source_sha = "N/A"
+    original_config_sha = "N/A"
     try:
         for attempt in range(MAX_RETRIES):
 
             cleanup_environment(project_name)
             current_attempt_id = attempt + 1
             processed_event_ids = set()
-            ledger_abs_file = TraceLedgerManager.get_ledger_path()
-            if os.path.exists(ledger_abs_file):
-                try:
-                    safe_delete_path(ledger_abs_file)
-                    print(f"--- 🧹 Cleared trace ledger for attempt {current_attempt_id} at {ledger_abs_file} ---")
-                except Exception as e:
-                    print(f"--- ⚠️ Failed to clean trace ledger for attempt {current_attempt_id}: {e} ---")
             stats = {
-                "repair_rounds": 0, "build_calls": 0, "rollback_count": 0,
+                "successful_patch_applications": 0, "build_calls": 0,
                 "total_tokens": {"prompt": 0, "completion": 0, "total": 0},
-                "code_gen_tokens": 0, "scores": [],
-                "decision_type": "UNKNOWN", "patch_impact": {"files": 0, "lines": 0},
-                "heuristic_used": False, "attempt_id": current_attempt_id
+                "code_gen_tokens": 0, "patch_impact": {"files": 0, "lines": 0},
+                "attempt_id": current_attempt_id
             }
             last_run_stats = stats
 
             # 🔑 统计：本次大循环专属统计变量（大循环切换时重置）
             attempt_start_time = time.time()
             attempt_tokens = {"prompt": 0, "completion": 0, "total": 0}
-            attempt_expert_matched = False
-            attempt_last_patch_files = 0
-            attempt_last_patch_lines = 0
 
             # 1. 必须先创建 Session 并准备好 state，才能初始化 Agent
             session_service = InMemorySessionService()
@@ -1328,28 +1321,6 @@ async def process_single_project(
             except Exception as e:
                 print(f"[CRITICAL] initialize_agents failed: {e}")
                 raise e
-
-            # 物理 Git 与账本一致性审计
-            ledger = TraceLedgerManager.load_ledger()
-            if ledger.get("nodes"):
-                last_node = ledger["nodes"][-1]
-                ledger_oss = last_node.get("git_sha_state", {}).get("oss-fuzz_sha")
-                ledger_prj = last_node.get("git_sha_state", {}).get("project_sha")
-
-                disk_oss = TraceLedgerManager.get_git_head_sha(os.path.join(os.getcwd(), "oss-fuzz"))
-                disk_prj = TraceLedgerManager.get_git_head_sha(expected_source_path)
-
-                if ledger_oss not in ("N/A", "PENDING") and disk_oss != "N/A" and ledger_oss != disk_oss:
-                    print(
-                        f"--- ⚠️ Integrity Mismatch [OSS-Fuzz]: Ledger={ledger_oss[:7]}, Disk={disk_oss[:7]}. Resetting... ---")
-                    subprocess.run(["git", "-C", "oss-fuzz", "reset", "--hard", ledger_oss], check=True)
-                    subprocess.run(["git", "-C", "oss-fuzz", "clean", "-fxd"], check=True)
-
-                if ledger_prj not in ("N/A", "PENDING") and disk_prj != "N/A" and ledger_prj != disk_prj:
-                    print(
-                        f"--- ⚠️ Integrity Mismatch [Upstream]: Ledger={ledger_prj[:7]}, Disk={disk_prj[:7]}. Resetting... ---")
-                    subprocess.run(["git", "-C", expected_source_path, "reset", "--hard", ledger_prj], check=True)
-                    subprocess.run(["git", "-C", expected_source_path, "clean", "-fxd"], check=True)
 
             # 初始化会话状态
             session.state["attempt_id"] = current_attempt_id
@@ -1376,54 +1347,6 @@ async def process_single_project(
             )
 
             print("初始化第三方项目路径", expected_source_path)
-
-            # 初始化基线账本 Node 0
-            initial_ledger = {
-                "project_name": project_name,
-                "archive_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "next_node_id": 1,
-                "nodes": [{
-                    "node_id": 0,
-                    "parent_id": -1,
-                    "identification": {
-                        "attempt_id": current_attempt_id,
-                        "round_id": 0,
-                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "node_status": "Stable",
-                        "should_rollback": False,
-                        "rollback_type": "NONE"
-                    },
-                    "git_sha_state": {
-                        "oss-fuzz_sha": "PENDING",
-                        "project_sha": "PENDING"
-                    },
-                    "action_and_intent": {
-                        "root_cause_commit_sha": "N/A",
-                        "active_workspace": "UNKNOWN",
-                        "target_file": "N/A",
-                        "repair_strategy": "Initial baseline state configuration.",
-                        "loop_summary": "Baseline compile completed."
-                    },
-                    "metrics": {
-                        "Ldel": 0, "Ladd": 0,
-                        "build_stage_before": "N/A",
-                        "build_stage_after": "L1"
-                    },
-                    "validation": {
-                        "step_1_6_bitmap": [0, 0, 0, 0, 0, 0],
-                        "validation_report_before": {},
-                        "validation_report_after": {}
-                    },
-                    "semantic_memory": {
-                        "solved_problems": "None. Initial setup completed.",
-                        "unsolved_problems": "Initial build attempt pending.",
-                        "reflection_analysis": "Initial environment setup."
-                    }
-                }]
-            }
-            TraceLedgerManager.save_ledger(initial_ledger)
-            print(
-                f"--- 📝 Node 0 (Baseline) placeholder initialized in trace ledger. SHA will be backfilled after setup. ---")
 
             GLOBAL_LOGGER.set_project_context(project_name)
             runner = Runner(agent=root_agent, app_name=APP_NAME, session_service=session_service)
@@ -1578,72 +1501,29 @@ async def process_single_project(
                                     session.state["root_cause_commit"] = data["root_cause_commit"]
                                     session.state["root_cause_workspace"] = data["root_cause_workspace"]
 
-                                    oss_sha_actual = TraceLedgerManager.get_git_head_sha(
-                                        os.path.join(os.getcwd(), "oss-fuzz"))
-                                    prj_sha_actual = TraceLedgerManager.get_git_head_sha(
-                                        session.state["project_source_path"])
+                                    if original_source_sha == "N/A":
+                                        original_source_sha = get_verified_git_sha(session.state["project_source_path"])
+                                    if original_config_sha == "N/A":
+                                        original_config_sha = get_verified_git_sha(
+                                            session.state["project_config_repo_path"])
 
-                                    TraceLedgerManager.update_node_fields(0, {
-                                        "git_sha_state.oss-fuzz_sha": oss_sha_actual,
-                                        "git_sha_state.project_sha": prj_sha_actual
-                                    })
-                                    # 完整性校验：确认写入值不再是占位符
-                                    if oss_sha_actual == "N/A" or prj_sha_actual == "N/A":
-                                        print(
-                                            f"--- ⚠️ [WARNING] Node 0 SHA backfill incomplete: oss={oss_sha_actual}, prj={prj_sha_actual}. manage_git_state(init) may have failed. ---")
-                                    else:
-                                        print(
-                                            f"--- 💾 Node 0 Git SHA successfully backfilled: {oss_sha_actual[:7]}|{prj_sha_actual[:7]} ---")
                                     print(
                                         f"--- 💾 Metadata synced successfully: source_path={session.state['project_source_path']}, config_path={session.state['project_config_path']}, config_repo_path={session.state['project_config_repo_path']} ---")
                             except Exception as e:
                                 print(f"--- ⚠️ Metadata sync failed: {e} ---")
 
-                    # 🔑 拦截 2：rsmc_agent 反思节点脱水
-                    if event.author == 'rsmc_agent' and event.actions and event.actions.state_delta:
-                        if 'loop_summary' in event.actions.state_delta:
-                            summary = event.actions.state_delta['loop_summary']
-                            if len(summary) > 800:
-                                event.actions.state_delta['loop_summary'] = summary[:797] + "..."
-                                print("--- [Orchestrator] Force truncated loop_summary to save tokens ---")
-                            print(
-                                "--- [Orchestrator] Step 3 RSMC finished. Executing Clean-1 (Pruning build logs)... ---")
-                            await _safe_memory_cleaning(session_service, current_session_id)
-
-                    # 🔑 拦截 3：solution_applier_agent 封版节点脱水
+                    # Keep only bounded state between ordinary repair rounds.
                     if event.author == 'solution_applier_agent' and event.actions and event.actions.state_delta:
                         if 'patch_application_result' in event.actions.state_delta:
-                            print(
-                                "--- [Orchestrator] Step 8 Applier finished. Executing Clean-2 (Pruning Solver & Finder history)... ---")
                             await _safe_memory_cleaning(session_service, current_session_id)
 
-                    # 🔑 拦截 4：监测定位完成
-                    if event.author == "commit_finder_agent" and event.actions and event.actions.state_delta:
-                        artifact_path = os.path.join(os.getcwd(), "generated_prompt_file", "commit_changed.txt")
-                        if os.path.exists(artifact_path):
-                            try:
-                                with open(artifact_path, 'r', encoding='utf-8', errors='ignore') as f:
-                                    content = f.read()
-                                    sha_m = re.search(r"SHA:\s*([a-f0-9]+)", content, re.I)
-                                    ws_m = re.search(r"\[ATTRIBUTION_TYPE\]\s*\n\s*(UPSTREAM|DOWNSTREAM)", content,
-                                                     re.I)
-                                    if sha_m and ws_m and not project_info.get("root_cause_commit"):
-                                        update_yaml_report(
-                                            file_path=yaml_path,
-                                            row_index=row_index,
-                                            result_str=None,
-                                            root_cause_commit=sha_m.group(1).strip(),
-                                            root_cause_workspace=ws_m.group(1).strip().upper()
-                                        )
-                            except Exception as e:
-                                print(f"--- ⚠️ Warning: Failed to sync commit_finder report to yaml: {e} ---")
-
-                    # 🔑 拦截 5：函数级探针劫持
+                    # Count only concrete tool responses.  Usage metadata is
+                    # accumulated once per de-duplicated model event above.
                     if (func_resps := event.get_function_responses()):
                         for resp in func_resps:
                             if resp.name in ['run_fuzz_build_streaming', 'run_fuzz_build_and_validate']:
                                 stats["build_calls"] += 1
-                                stats["repair_rounds"] = max(0, stats["build_calls"] - 1)
+                                project_stats["build_calls"] += 1
 
                             if resp.name == 'run_fuzz_build_and_validate':
                                 val_report = resp.response.get('validation_report')
@@ -1653,95 +1533,19 @@ async def process_single_project(
                                     session.state["last_validation_report"] = val_report
                                     session.state["rollback_triggered"] = False
 
-                                    # 🔑 修复：对所有轮次执行 CBSC，写入当前活跃节点的 build_stage_after
-                                    # 原逻辑只处理 round_id == 0，导致 Node 1、2、3 的 build_stage_after 永远为 null
-                                    print(
-                                        "--- [补全] Executing CBSC for current node build_stage_after backfill... ---")
-                                    classification = cbsc_classify_log()
-                                    determined_stage = classification["determined_stage"]
-
-                                    print(
-                                        f"[DBG] before backfill: round_id={session.state.get('round_id')}, current_node_id={session.state.get('current_node_id')}")
-                                    ledger_for_stage = TraceLedgerManager.load_ledger()
-                                    print(
-                                        f"[DBG] ledger last node id={ledger_for_stage['nodes'][-1]['node_id'] if ledger_for_stage.get('nodes') else 'EMPTY'}")
-                                    if ledger_for_stage.get("nodes"):
-                                        target_node_id = ledger_for_stage["nodes"][-1].get("node_id", 0)
-                                    else:
-                                        target_node_id = 0
-                                    print(
-                                        f"[DBG] target_node_id={target_node_id}, determined_stage={determined_stage}")
-
-                                    bitmap_keys = [
-                                        "step_1_official_list",
-                                        "step_2_infra_compliance",
-                                        "step_3_sanitizer_injected",
-                                        "step_4_engine_control",
-                                        "step_5_logic_linkage",
-                                        "step_6_runtime_stability"
-                                    ]
-                                    step_1_6_bitmap = [
-                                        1 if str(val_report.get(key, "")).startswith("pass") else 0
-                                        for key in bitmap_keys
-                                    ]
-
-                                    TraceLedgerManager.update_node_fields(target_node_id, {
-                                        "metrics.build_stage_after": determined_stage,
-                                        "validation.validation_report_after": val_report,
-                                        "validation.step_1_6_bitmap": step_1_6_bitmap
-                                    })
-                                    print(
-                                        f"--- [补全] Node {target_node_id} build_stage_after = {determined_stage} ---")
-
-
-                            if resp.name == 'execute_hsr_decision':
-                                if resp.response.get("action") == "ROLLBACK":
-                                    session = await session_service.get_session(app_name=APP_NAME, user_id=USER_ID,
-                                                                                session_id=current_session_id)
-                                    session.state["current_node_id"] = resp.response.get("target_node_id")
-
-                            # 🔑 统计：监听专家知识匹配结果
-                            if resp.name == 'few_shot_rag_retrieve':
-                                rag_count = resp.response.get('matched_errors_count', 0)
-                                if rag_count and rag_count > 0:
-                                    attempt_expert_matched = True
-
                             if resp.name == 'apply_patch' and resp.response.get('status') in ['success',
                                                                                               'partial_success']:
-                                # 🔑 统计：记录最后一次 patch 的文件数和行数
-                                attempt_last_patch_files = resp.response.get('modified_files_count', 0)
-                                attempt_last_patch_lines = resp.response.get('modified_lines_count', 0)
-
-                                # 🔑 修正：upstream 标志监测保留在此处，但 SHA 写入移至 commit 响应后执行
-                                session = await session_service.get_session(app_name=APP_NAME, user_id=USER_ID,
-                                                                            session_id=current_session_id)
-                                ledger = TraceLedgerManager.load_ledger()
-                                if ledger.get("nodes"):
-                                    last_node = ledger["nodes"][-1]
-                                    if last_node.get("action_and_intent", {}).get("active_workspace") == "UPSTREAM":
-                                        if session:
-                                            session.state["ever_used_upstream"] = True
-
-                                # 🔑 新增：在 manage_git_state commit 完成后读取真实 SHA 写入账本
-                            if resp.name == 'commit_workspace_snapshots' and resp.response.get('status') == 'success':
-                                session = await session_service.get_session(app_name=APP_NAME, user_id=USER_ID,
-                                                                            session_id=current_session_id)
-                                oss_sha = resp.response.get('oss_fuzz_sha', 'N/A')
-                                prj_sha = resp.response.get('project_sha', 'N/A')
-
-                                # 🔑 修复：从账本读取最新节点号，而非依赖从不更新的 current_node_id
-                                ledger_for_sha = TraceLedgerManager.load_ledger()
-                                if ledger_for_sha.get("nodes"):
-                                    curr_node = ledger_for_sha["nodes"][-1].get("node_id", 0)
-                                else:
-                                    curr_node = session.state.get("current_node_id", 0) if session else 0
-
-                                TraceLedgerManager.update_node_fields(curr_node, {
-                                    "git_sha_state.oss-fuzz_sha": oss_sha,
-                                    "git_sha_state.project_sha": prj_sha
-                                })
-                                print(
-                                    f"--- 💾 Node {curr_node} SHA updated after commit: oss={oss_sha[:7] if oss_sha != 'N/A' else 'N/A'}, prj={prj_sha[:7] if prj_sha != 'N/A' else 'N/A'} ---")
+                                stats["successful_patch_applications"] += 1
+                                project_stats["successful_patch_applications"] += 1
+                                stats["patch_impact"]["files"] += resp.response.get('modified_files_count', 0)
+                                stats["patch_impact"]["lines"] += resp.response.get('modified_lines_count', 0)
+                                snapshot_result = commit_workspace_snapshots(
+                                    project_source_path=session.state["project_source_path"],
+                                    project_config_path=session.state["project_config_path"],
+                                    attempt_id=current_attempt_id,
+                                )
+                                if snapshot_result.get("status") != "success":
+                                    print(f"--- ⚠️ Snapshot commit failed: {snapshot_result} ---")
 
                     # 实时监控退出条件
                     curr_session = await session_service.get_session(app_name=APP_NAME, user_id=USER_ID,
@@ -1774,7 +1578,12 @@ async def process_single_project(
                         os.getcwd(), "generated_prompt_file", "final_verified_patch"
                     )
                     final_patch_snapshot = _snapshot_verified_solution(snapshot_dir)
-                    _attach_verified_git_refs(project_name, final_patch_snapshot)
+                    _attach_verified_git_refs(
+                        project_name,
+                        final_patch_snapshot,
+                        original_source_sha=original_source_sha,
+                        original_config_sha=original_config_sha,
+                    )
                     if ENABLE_PATCH_OPTIMIZATION:
                         agent_tools.set_project_phase("optimizer")
                         try:
@@ -1846,12 +1655,9 @@ async def process_single_project(
             project_info=project_info,
             is_successful=is_successful,
             attempt_id=current_attempt_id,
-            stats=stats,
-            attempt_tokens=attempt_tokens,
-            attempt_start_time=attempt_start_time,
-            attempt_expert_matched=attempt_expert_matched,
-            attempt_last_patch_files=attempt_last_patch_files,
-            attempt_last_patch_lines=attempt_last_patch_lines,
+            stats=project_stats,
+            project_tokens=project_total_tokens,
+            project_start_time=project_start_time,
             final_patch_snapshot=final_patch_snapshot,
         )
 

@@ -1,0 +1,17 @@
+.env
+.idea/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+agent_logs/
+archive/
+process/
+oss-fuzz/
+build_error_log/
+fuzz_build_log_file/
+generated_prompt_file/
+projects_all.yaml
+result.txt
+solution.txt
+repair_strategy.txt
+project_repair_trace.json

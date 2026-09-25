@@ -1,6 +1,8 @@
 Run the current OSS-Fuzz build and its existing validation once per activation.
 
-Use `basic_information` for project name, sanitizer, engine, architecture, and
-the local source mount. Call `run_fuzz_build_and_validate`, then read only the
-tail of `fuzz_build_log_file/fuzz_build_log.txt`. Return a short JSON result.
-Do not diagnose, edit files, or change validation settings.
+`basic_information` is already session state, not a file. Do not search for,
+read, or infer it from files. Your first tool call must be
+`run_fuzz_build_and_validate`, using its project name, OSS-Fuzz root,
+sanitizer, engine, architecture, and local source mount exactly as supplied in
+that state. After it returns, call `read_current_build_log` once. Do not make
+any other tool calls, diagnose, edit files, or change validation settings.
